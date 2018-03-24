@@ -33,7 +33,7 @@ class Worker
      *
      * @var string
      */
-    const VERSION = '3.5.4';
+    const VERSION = '3.5.5';
 
     /**
      * Status starting.
@@ -227,9 +227,15 @@ class Worker
     /**
      * Pause accept new connections or not.
      *
-     * @var string
+     * @var bool
      */
     protected $_pauseAccept = true;
+    
+    /**
+     * Is worker stopping ?
+     * @var bool
+     */
+    public $stopping = false;
 
     /**
      * Daemonize.
@@ -419,7 +425,8 @@ class Worker
      */
     protected static $_availableEventLoops = array(
         'libevent' => '\Workerman\Events\Libevent',
-        'event'    => '\Workerman\Events\Event'
+        'event'    => '\Workerman\Events\Event',
+	'swoole'   => '\Workerman\Events\Swoole'
     );
 
     /**
@@ -601,6 +608,7 @@ class Worker
     {
         foreach (static::$_workers as $worker_id => $worker) {
             $new_id_map = array();
+            $worker->count = $worker->count <= 0 ? 1 : $worker->count;
             for($key = 0; $key < $worker->count; $key++) {
                 $new_id_map[$key] = isset(static::$_idMap[$worker_id][$key]) ? static::$_idMap[$worker_id][$key] : 0;
             }
@@ -758,11 +766,11 @@ class Worker
                 if ($command2 === '-g') {
                     static::$_gracefulStop = true;
                     $sig = SIGTERM;
-                    static::log("Workerman[$start_file] is gracefully stoping ...");
+                    static::log("Workerman[$start_file] is gracefully stopping ...");
                 } else {
                     static::$_gracefulStop = false;
                     $sig = SIGINT;
-                    static::log("Workerman[$start_file] is stoping ...");
+                    static::log("Workerman[$start_file] is stopping ...");
                 }
                 // Send stop signal to master process.
                 $master_pid && posix_kill($master_pid, $sig);
@@ -825,6 +833,14 @@ class Worker
         unset($info[0]);
         $data_waiting_sort = array();
         $read_process_status = false;
+		$total_requests = 0;
+		$total_qps = 0;
+		$total_connections = 0;
+		$total_fails = 0;
+		$total_memory = 0;
+		$total_timers = 0;
+		$maxLen1 = static::$_maxSocketNameLength;
+		$maxLen2 = static::$_maxWorkerNameLength;
         foreach($info as $key => $value) {
             if (!$read_process_status) {
                 $status_str .= $value . "\n";
@@ -836,8 +852,15 @@ class Worker
             if(preg_match('/^[0-9]+/', $value, $pid_math)) {
                 $pid = $pid_math[0];
                 $data_waiting_sort[$pid] = $value;
-                if(preg_match('/^\S+?\s+?\S+?\s+?\S+?\s+?\S+?\s+?\S+?\s+?\S+?\s+?\S+?\s+?(\S+?)\s+?/', $value, $match)) {
-                    $current_total_request[$pid] = $match[1];
+                if(preg_match('/^\S+?\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?(\S+?)\s+?/', $value, $match)) {
+					$total_memory += intval(str_ireplace('M','',$match[1]));
+					$maxLen1 = max($maxLen1,strlen($match[2]));
+					$maxLen2 = max($maxLen2,strlen($match[3]));
+					$total_connections += intval($match[4]);
+					$total_fails += intval($match[5]);
+					$total_timers += intval($match[6]);
+                    $current_total_request[$pid] = $match[7];
+					$total_requests += intval($match[7]);
                 }
             }
         }
@@ -855,10 +878,18 @@ class Worker
                 $qps = 0;
             } else {
                 $qps = $current_total_request[$pid] - $total_request_cache[$pid];
+				$total_qps += $qps;
             }
             $status_str .= $data_waiting_sort[$pid]. " " . str_pad($qps, 6) ." [idle]\n";
         }
         $total_request_cache = $current_total_request;
+		$status_str .= "----------------------------------------------PROCESS STATUS---------------------------------------------------\n";
+		$status_str .= "Summary\t" . str_pad($total_memory.'M', 7) . " "
+			. str_pad('-', $maxLen1) . " "
+			. str_pad('-', $maxLen2) . " "
+			. str_pad($total_connections, 11) . " " . str_pad($total_fails, 9) . " "
+			. str_pad($total_timers, 7) . " " . str_pad($total_requests, 13) . " "
+			. str_pad($total_qps,6)." [Summary] \n";
         return $status_str;
     }
 
@@ -917,7 +948,7 @@ class Worker
         static::$globalEvent->add(SIGUSR1, EventInterface::EV_SIGNAL, array('\Workerman\Worker', 'signalHandler'));
         // reinstall graceful reload signal handler
         static::$globalEvent->add(SIGQUIT, EventInterface::EV_SIGNAL, array('\Workerman\Worker', 'signalHandler'));
-        // reinstall  status signal handler
+        // reinstall status signal handler
         static::$globalEvent->add(SIGUSR2, EventInterface::EV_SIGNAL, array('\Workerman\Worker', 'signalHandler'));
         // reinstall connection status signal handler
         static::$globalEvent->add(SIGIO, EventInterface::EV_SIGNAL, array('\Workerman\Worker', 'signalHandler'));
@@ -1121,7 +1152,6 @@ class Worker
                 }
             }
 
-            $worker->count = $worker->count <= 0 ? 1 : $worker->count;
             while (count(static::$_pidMap[$worker->workerId]) < $worker->count) {
                 static::forkOneWorkerForLinux($worker);
             }
@@ -1600,9 +1630,13 @@ class Worker
         else {
             // Execute exit.
             foreach (static::$_workers as $worker) {
-                $worker->stop();
+                if(!$worker->stopping){
+                    $worker->stop();
+                    $worker->stopping = true;
+                }
             }
             if (!static::$_gracefulStop || ConnectionInterface::$statistics['connection_count'] <= 0) {
+                static::$_workers = array();
                 static::$globalEvent->destroy();
                 exit(0);
             }
@@ -1695,6 +1729,7 @@ class Worker
         }
 
         // For child processes.
+        reset(static::$_workers);
         /** @var \Workerman\Worker $worker */
         $worker            = current(static::$_workers);
         $worker_status_str = posix_getpid() . "\t" . str_pad(round(memory_get_usage(true) / (1024 * 1024), 2) . "M", 7)
@@ -2124,8 +2159,6 @@ class Worker
         }
         // Clear callback.
         $this->onMessage = $this->onClose = $this->onError = $this->onBufferDrain = $this->onBufferFull = null;
-        // Remove worker instance from static::$_workers.
-        unset(static::$_workers[$this->workerId]);
     }
 
     /**
